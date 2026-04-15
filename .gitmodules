@@ -1,0 +1,4 @@
+[submodule "vendor/conf-py"]
+	path = vendor/conf-py
+	url = git@github.com:vnvmar/conf.py.git
+	branch = main
