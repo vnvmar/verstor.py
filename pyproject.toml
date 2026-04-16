@@ -8,7 +8,7 @@ requires-python = ">=3.14"
 dependencies = [
     "agno>=2.5.16",
     "azure-storage-blob>=12.28.0",
-    "conf-py==0.1.0",
+    "conf==0.1.0",
     "pydantic>=2.13.0",
     "semver>=3.0.4",
     "typer>=0.24.1",
@@ -23,7 +23,7 @@ include = ["verstor*"]
 exclude = ["libs*", "tests*", "vendor*"]
 
 [tool.uv.sources]
-conf-py = { path = "libs/conf_py-0.1.0-py3-none-any.whl" }
+conf = { path = "libs/conf-0.1.0-py3-none-any.whl" }
 
 [dependency-groups]
 dev = [

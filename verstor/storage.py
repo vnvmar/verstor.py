@@ -1,7 +1,7 @@
 
 import json
 from pathlib import Path
-from typing import ClassVar, Protocol, Self, runtime_checkable
+from typing import ClassVar, Mapping, Protocol, Self, overload, runtime_checkable
 
 from azure.core.exceptions import ResourceNotFoundError
 from azure.storage.blob import BlobServiceClient, ContainerClient
@@ -11,11 +11,43 @@ from semver import Version
 
 from verstor.types import INITIAL_VERSION, EntityBase, EntityRef, EntityVersion
 
+type _GetDispatchKey = type[EntityVersion[EntityBase]] | type[EntityRef[EntityBase]] | type[type]
+type _SetDispatchKey = type[EntityVersion[EntityBase]] | type[EntityRef[EntityBase]] | type[str] | None
+type _ResolvedEntityTarget[T: EntityBase] = tuple[type[T], str, str]
+
 
 @runtime_checkable
 class Storage(Protocol):
-    def get[T: EntityBase](self, target: EntityRef[T] | EntityVersion[T]) -> EntityVersion[T]: ...
-    def set[T: EntityBase](self, entity: T, target: EntityRef[T] | EntityVersion[T] | None = None) -> EntityVersion[T]: ...
+    @overload
+    def get[T: EntityBase](self, target: EntityVersion[T]) -> EntityVersion[T]: ...
+    @overload
+    def get[T: EntityBase](self, target: EntityRef[T]) -> EntityVersion[T]: ...
+    @overload
+    def get[T: EntityBase](self, target: type[T], id: str) -> EntityVersion[T]: ...
+    @overload
+    def get[T: EntityBase](self, target: type[T], id: str, version: str) -> EntityVersion[T]: ...
+    def get[T: EntityBase](
+        self,
+        target: EntityRef[T] | EntityVersion[T] | type[T],
+        id: str | None = None,
+        version: str | None = None,
+    ) -> EntityVersion[T]: ...
+    @overload
+    def set[T: EntityBase](self, entity: T) -> EntityVersion[T]: ...
+    @overload
+    def set[T: EntityBase](self, entity: T, target: EntityVersion[T]) -> EntityVersion[T]: ...
+    @overload
+    def set[T: EntityBase](self, entity: T, target: EntityRef[T]) -> EntityVersion[T]: ...
+    @overload
+    def set[T: EntityBase](self, entity: T, target: str) -> EntityVersion[T]: ...
+    @overload
+    def set[T: EntityBase](self, entity: T, target: str, version: str) -> EntityVersion[T]: ...
+    def set[T: EntityBase](
+        self,
+        entity: T,
+        target: EntityRef[T] | EntityVersion[T] | str | None = None,
+        version: str | None = None,
+    ) -> EntityVersion[T]: ...
 
 
 class FileStorage(BaseModel):
@@ -61,38 +93,216 @@ class FileStorage(BaseModel):
                 continue
         return sorted(versions)
 
-class LocalStorage(FileStorage):
 
-    def get[T: EntityBase](self, target: EntityRef[T] | EntityVersion[T]) -> EntityVersion[T]:
+class _StorageDispatchMixin:
+    _GET_DISPATCH: ClassVar[Mapping[_GetDispatchKey, str]] = {
+        EntityVersion: "_get_from_entity_version_target",
+        EntityRef: "_get_from_entity_ref_target",
+        type: "_get_from_entity_type_target",
+    }
+    _SET_DISPATCH: ClassVar[Mapping[_SetDispatchKey, str]] = {
+        None: "_set_without_target",
+        EntityVersion: "_set_with_entity_version_target",
+        EntityRef: "_set_with_entity_ref_target",
+        str: "_set_with_id_target",
+    }
+
+    def _resolve_get_dispatch_key[T: EntityBase](self, target: EntityRef[T] | EntityVersion[T] | type[T]) -> _GetDispatchKey:
         if isinstance(target, EntityVersion):
-            version = target.version
-        else:
-            version = self.read_active_version(target.tag, target.id)
+            return EntityVersion
+        if isinstance(target, EntityRef):
+            return EntityRef
+        return type
 
-        path = self.resolve_version_path(target.tag, target.id, version)
-        entity = target.t.model_validate_json(path.read_text(encoding="utf-8"))
-        return entity.ver(target.id, version)
-
-    def set[T: EntityBase](self, entity: T, target: EntityRef[T] | EntityVersion[T] | None = None) -> EntityVersion[T]:
+    def _resolve_set_dispatch_key[T: EntityBase](
+        self,
+        target: EntityRef[T] | EntityVersion[T] | str | None,
+    ) -> _SetDispatchKey:
         if target is None:
-            ref = EntityRef[T].of(type(entity))
-            version = str(INITIAL_VERSION)
-            self._write_entity(entity, ref.id, version)
-            self.write_active_version(entity.tag, ref.id, version)
-            return entity.ver(ref.id, version)
-
+            return None
         if isinstance(target, EntityVersion):
-            self._write_entity(entity, target.id, target.version)
-            active_path = self.resolve_active_path(target.tag, target.id)
-            if active_path.exists() and self.read_active_version(target.tag, target.id) == target.version:
-                self.write_active_version(target.tag, target.id, target.version)
-            return entity.ver(target.id, target.version)
+            return EntityVersion
+        if isinstance(target, EntityRef):
+            return EntityRef
+        return str
 
-        versions = self.list_versions(target.tag, target.id)
-        version = str(versions[-1].bump_patch()) if versions else str(INITIAL_VERSION)
-        self._write_entity(entity, target.id, version)
-        self.write_active_version(target.tag, target.id, version)
-        return entity.ver(target.id, version)
+    def _get_entity_version[T: EntityBase](
+        self,
+        target: EntityRef[T] | EntityVersion[T] | type[T],
+        id: str | None = None,
+        version: str | None = None,
+    ) -> EntityVersion[T]:
+        dispatch_key = self._resolve_get_dispatch_key(target)
+        handler_name = self._GET_DISPATCH[dispatch_key]
+        entity_type, entity_id, resolved_version = getattr(self, handler_name)(target, id, version)
+        return self._read_entity_version(entity_type, entity_id, resolved_version)
+
+    def _set_entity_version[T: EntityBase](
+        self,
+        entity: T,
+        target: EntityRef[T] | EntityVersion[T] | str | None = None,
+        version: str | None = None,
+    ) -> EntityVersion[T]:
+        dispatch_key = self._resolve_set_dispatch_key(target)
+        handler_name = self._SET_DISPATCH[dispatch_key]
+        return getattr(self, handler_name)(entity, target, version)
+
+    def _get_from_entity_version_target[T: EntityBase](
+        self,
+        target: EntityVersion[T],
+        id: str | None,
+        version: str | None,
+    ) -> _ResolvedEntityTarget[T]:
+        if id is not None or version is not None:
+            raise TypeError("id and version cannot be passed with EntityVersion targets")
+        return target.t, target.id, target.version
+
+    def _get_from_entity_ref_target[T: EntityBase](
+        self,
+        target: EntityRef[T],
+        id: str | None,
+        version: str | None,
+    ) -> _ResolvedEntityTarget[T]:
+        if id is not None or version is not None:
+            raise TypeError("id and version cannot be passed with EntityRef targets")
+        return target.t, target.id, self.read_active_version(target.tag, target.id)
+
+    def _get_from_entity_type_target[T: EntityBase](
+        self,
+        target: type[T],
+        id: str | None,
+        version: str | None,
+    ) -> _ResolvedEntityTarget[T]:
+        if id is None:
+            raise TypeError("id is required when target is an entity type")
+        resolved_version = version if version is not None else self.read_active_version(target.tag, id)
+        return target, id, resolved_version
+
+    def _set_without_target[T: EntityBase](
+        self,
+        entity: T,
+        _: None,
+        version: str | None,
+    ) -> EntityVersion[T]:
+        if version is not None:
+            raise TypeError("version cannot be passed without a target")
+        ref = EntityRef[T].of(type(entity))
+        resolved_version = str(INITIAL_VERSION)
+        self._write_entity(entity, ref.id, resolved_version)
+        self.write_active_version(entity.tag, ref.id, resolved_version)
+        return entity.ver(ref.id, resolved_version)
+
+    def _set_with_entity_version_target[T: EntityBase](
+        self,
+        entity: T,
+        target: EntityVersion[T],
+        version: str | None,
+    ) -> EntityVersion[T]:
+        if version is not None:
+            raise TypeError("version cannot be passed with EntityVersion targets")
+        self._write_entity(entity, target.id, target.version)
+        self._update_active_if_current(target.tag, target.id, target.version)
+        return entity.ver(target.id, target.version)
+
+    def _set_with_entity_ref_target[T: EntityBase](
+        self,
+        entity: T,
+        target: EntityRef[T],
+        version: str | None,
+    ) -> EntityVersion[T]:
+        if version is not None:
+            raise TypeError("version cannot be passed with EntityRef targets")
+        resolved_version = self._next_version(target.tag, target.id)
+        self._write_entity(entity, target.id, resolved_version)
+        self.write_active_version(target.tag, target.id, resolved_version)
+        return entity.ver(target.id, resolved_version)
+
+    def _set_with_id_target[T: EntityBase](
+        self,
+        entity: T,
+        target: str,
+        version: str | None,
+    ) -> EntityVersion[T]:
+        if version is not None:
+            self._write_entity(entity, target, version)
+            self._update_active_if_current(entity.tag, target, version)
+            return entity.ver(target, version)
+
+        resolved_version = self._next_version(entity.tag, target)
+        self._write_entity(entity, target, resolved_version)
+        self.write_active_version(entity.tag, target, resolved_version)
+        return entity.ver(target, resolved_version)
+
+    def _next_version(self, tag: str, id: str) -> str:
+        versions = self.list_versions(tag, id)
+        return str(versions[-1].bump_patch()) if versions else str(INITIAL_VERSION)
+
+    def _update_active_if_current(self, tag: str, id: str, version: str) -> None:
+        if self._active_exists(tag, id) and self.read_active_version(tag, id) == version:
+            self.write_active_version(tag, id, version)
+
+    def _read_entity_version[T: EntityBase](self, entity_type: type[T], id: str, version: str) -> EntityVersion[T]:
+        entity = entity_type.model_validate_json(self._read_entity_text(entity_type, id, version))
+        return entity.ver(id, version)
+
+    def _read_entity_text[T: EntityBase](self, entity_type: type[T], id: str, version: str) -> str:
+        raise NotImplementedError
+
+    def _write_entity(self, entity: EntityBase, id: str, version: str) -> None:
+        raise NotImplementedError
+
+    def _active_exists(self, tag: str, id: str) -> bool:
+        raise NotImplementedError
+
+    def list_versions(self, tag: str, id: str) -> list[Version]: ...
+
+    def read_active_version(self, tag: str, id: str) -> str: ...
+
+    def write_active_version(self, tag: str, id: str, version: str) -> None: ...
+
+
+class LocalStorage(FileStorage, _StorageDispatchMixin):
+
+    @overload
+    def get[T: EntityBase](self, target: EntityVersion[T]) -> EntityVersion[T]: ...
+    @overload
+    def get[T: EntityBase](self, target: EntityRef[T]) -> EntityVersion[T]: ...
+    @overload
+    def get[T: EntityBase](self, target: type[T], id: str) -> EntityVersion[T]: ...
+    @overload
+    def get[T: EntityBase](self, target: type[T], id: str, version: str) -> EntityVersion[T]: ...
+    def get[T: EntityBase](
+        self,
+        target: EntityRef[T] | EntityVersion[T] | type[T],
+        id: str | None = None,
+        version: str | None = None,
+    ) -> EntityVersion[T]:
+        return self._get_entity_version(target, id, version)
+
+    @overload
+    def set[T: EntityBase](self, entity: T) -> EntityVersion[T]: ...
+    @overload
+    def set[T: EntityBase](self, entity: T, target: EntityVersion[T]) -> EntityVersion[T]: ...
+    @overload
+    def set[T: EntityBase](self, entity: T, target: EntityRef[T]) -> EntityVersion[T]: ...
+    @overload
+    def set[T: EntityBase](self, entity: T, target: str) -> EntityVersion[T]: ...
+    @overload
+    def set[T: EntityBase](self, entity: T, target: str, version: str) -> EntityVersion[T]: ...
+    def set[T: EntityBase](
+        self,
+        entity: T,
+        target: EntityRef[T] | EntityVersion[T] | str | None = None,
+        version: str | None = None,
+    ) -> EntityVersion[T]:
+        return self._set_entity_version(entity, target, version)
+
+    def _read_entity_text[T: EntityBase](self, entity_type: type[T], id: str, version: str) -> str:
+        path = self.resolve_version_path(entity_type.tag, id, version)
+        return path.read_text(encoding="utf-8")
+
+    def _active_exists(self, tag: str, id: str) -> bool:
+        return self.resolve_active_path(tag, id).exists()
 
     def _write_entity(self, entity: EntityBase, id: str, version: str) -> None:
         path = self.resolve_version_path(entity.tag, id, version)
@@ -100,7 +310,7 @@ class LocalStorage(FileStorage):
         path.write_text(entity.model_dump_json(indent=4), encoding="utf-8")
 
 
-class AzureBlobStorage(BaseModel):
+class AzureBlobStorage(_StorageDispatchMixin, BaseModel):
     container: str = Field(
         default=...,
         description="Azure Blob Storage container name.",
@@ -188,36 +398,45 @@ class AzureBlobStorage(BaseModel):
                 continue
         return sorted(versions)
 
-    def get[T: EntityBase](self, target: EntityRef[T] | EntityVersion[T]) -> EntityVersion[T]:
-        if isinstance(target, EntityVersion):
-            version = target.version
-        else:
-            version = self.read_active_version(target.tag, target.id)
+    @overload
+    def get[T: EntityBase](self, target: EntityVersion[T]) -> EntityVersion[T]: ...
+    @overload
+    def get[T: EntityBase](self, target: EntityRef[T]) -> EntityVersion[T]: ...
+    @overload
+    def get[T: EntityBase](self, target: type[T], id: str) -> EntityVersion[T]: ...
+    @overload
+    def get[T: EntityBase](self, target: type[T], id: str, version: str) -> EntityVersion[T]: ...
+    def get[T: EntityBase](
+        self,
+        target: EntityRef[T] | EntityVersion[T] | type[T],
+        id: str | None = None,
+        version: str | None = None,
+    ) -> EntityVersion[T]:
+        return self._get_entity_version(target, id, version)
 
-        content = self._read_blob_text(self.resolve_version_name(target.tag, target.id, version))
-        entity = target.t.model_validate_json(content)
-        return entity.ver(target.id, version)
+    @overload
+    def set[T: EntityBase](self, entity: T) -> EntityVersion[T]: ...
+    @overload
+    def set[T: EntityBase](self, entity: T, target: EntityVersion[T]) -> EntityVersion[T]: ...
+    @overload
+    def set[T: EntityBase](self, entity: T, target: EntityRef[T]) -> EntityVersion[T]: ...
+    @overload
+    def set[T: EntityBase](self, entity: T, target: str) -> EntityVersion[T]: ...
+    @overload
+    def set[T: EntityBase](self, entity: T, target: str, version: str) -> EntityVersion[T]: ...
+    def set[T: EntityBase](
+        self,
+        entity: T,
+        target: EntityRef[T] | EntityVersion[T] | str | None = None,
+        version: str | None = None,
+    ) -> EntityVersion[T]:
+        return self._set_entity_version(entity, target, version)
 
-    def set[T: EntityBase](self, entity: T, target: EntityRef[T] | EntityVersion[T] | None = None) -> EntityVersion[T]:
-        if target is None:
-            ref = EntityRef[T].of(type(entity))
-            version = str(INITIAL_VERSION)
-            self._write_entity(entity, ref.id, version)
-            self.write_active_version(entity.tag, ref.id, version)
-            return entity.ver(ref.id, version)
+    def _read_entity_text[T: EntityBase](self, entity_type: type[T], id: str, version: str) -> str:
+        return self._read_blob_text(self.resolve_version_name(entity_type.tag, id, version))
 
-        if isinstance(target, EntityVersion):
-            self._write_entity(entity, target.id, target.version)
-            if self._blob_exists(self.resolve_active_name(target.tag, target.id)):
-                if self.read_active_version(target.tag, target.id) == target.version:
-                    self.write_active_version(target.tag, target.id, target.version)
-            return entity.ver(target.id, target.version)
-
-        versions = self.list_versions(target.tag, target.id)
-        version = str(versions[-1].bump_patch()) if versions else str(INITIAL_VERSION)
-        self._write_entity(entity, target.id, version)
-        self.write_active_version(target.tag, target.id, version)
-        return entity.ver(target.id, version)
+    def _active_exists(self, tag: str, id: str) -> bool:
+        return self._blob_exists(self.resolve_active_name(tag, id))
 
     def _write_entity(self, entity: EntityBase, id: str, version: str) -> None:
         self._write_blob_text(self.resolve_version_name(entity.tag, id, version), entity.model_dump_json(indent=4))

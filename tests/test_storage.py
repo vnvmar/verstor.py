@@ -29,15 +29,15 @@ def test_set_without_target_creates_initial_version_and_active_pointer(tmp_path:
 
     assert saved.version == "1.0.0"
     assert json.loads((tmp_path / TAG / saved.id / "active.json").read_text(encoding="utf-8")) == "1.0.0"
-    assert storage.get(saved.ref(saved.id)).entity == draft
+    assert storage.get(NameModel, saved.id).entity == draft
 
 
-def test_get_with_entity_version_bypasses_active_pointer(tmp_path: Path) -> None:
+def test_get_with_type_id_version_bypasses_active_pointer(tmp_path: Path) -> None:
     storage = LocalStorage(base=tmp_path)
     created = storage.set(NameModel(name="v1"))
     storage.set(NameModel(name="v2"), created.ref())
 
-    loaded = storage.get(NameModel(name="placeholder").ver(created.id, "1.0.0"))
+    loaded = storage.get(NameModel, created.id, "1.0.0")
 
     assert loaded.version == "1.0.0"
     assert loaded.entity == NameModel(name="v1")
@@ -55,21 +55,45 @@ def test_set_with_entity_ref_creates_next_patch_and_updates_active(tmp_path: Pat
     assert storage.get(created.ref()).entity == NameModel(name="v2")
 
 
+def test_set_with_id_creates_next_patch_and_updates_active(tmp_path: Path) -> None:
+    storage = LocalStorage(base=tmp_path)
+    created = storage.set(NameModel(name="v1"))
+
+    updated = storage.set(NameModel(name="v2"), created.id)
+
+    assert updated.id == created.id
+    assert updated.version == "1.0.1"
+    assert json.loads((tmp_path / TAG / created.id / "active.json").read_text(encoding="utf-8")) == "1.0.1"
+    assert storage.get(NameModel, created.id).entity == NameModel(name="v2")
+
+
 def test_set_with_entity_version_overwrites_specific_version_without_changing_active(tmp_path: Path) -> None:
     storage = LocalStorage(base=tmp_path)
     created = storage.set(NameModel(name="v1"))
     active = storage.set(NameModel(name="v2"), created.ref())
-    placeholder = NameModel(name="placeholder").ver(created.id, "1.0.0")
 
     overwritten = storage.set(
         NameModel(name="rewritten-v1"),
-        placeholder,
+        created,
     )
 
     assert overwritten.version == "1.0.0"
-    assert storage.get(placeholder).entity == NameModel(name="rewritten-v1")
+    assert storage.get(created).entity == NameModel(name="rewritten-v1")
     assert storage.get(created.ref()).version == active.version
     assert storage.get(created.ref()).entity == NameModel(name="v2")
+
+
+def test_set_with_id_and_version_overwrites_specific_version_without_changing_active(tmp_path: Path) -> None:
+    storage = LocalStorage(base=tmp_path)
+    created = storage.set(NameModel(name="v1"))
+    active = storage.set(NameModel(name="v2"), created.id)
+
+    overwritten = storage.set(NameModel(name="rewritten-v1"), created.id, "1.0.0")
+
+    assert overwritten.version == "1.0.0"
+    assert storage.get(NameModel, created.id, "1.0.0").entity == NameModel(name="rewritten-v1")
+    assert storage.get(NameModel, created.id).version == active.version
+    assert storage.get(NameModel, created.id).entity == NameModel(name="v2")
 
 
 def test_get_entity_ref_without_active_json_raises(tmp_path: Path) -> None:
@@ -142,7 +166,7 @@ def test_azure_blob_storage_from_config_instance_loads_storage_settings(tmp_path
 def test_azure_blob_storage_from_config_requires_connection_string(tmp_path: Path) -> None:
     path = write_config(tmp_path / "config.json", {"azure": {"storage": {"container": "models"}}})
 
-    with pytest.raises(EnvironmentError, match="CONNECTION_STRING"):
+    with pytest.raises(KeyError, match="CONNECTION_STRING"):
         AzureBlobStorage.from_config(path)
 
 
@@ -152,7 +176,7 @@ def test_azure_blob_storage_from_config_requires_container(tmp_path: Path) -> No
         {"azure": {"storage": {"connection_string": "UseDevelopmentStorage=true"}}},
     )
 
-    with pytest.raises(EnvironmentError, match="CONTAINER"):
+    with pytest.raises(KeyError, match="CONTAINER"):
         AzureBlobStorage.from_config(path)
 
 
@@ -184,15 +208,15 @@ def test_azure_set_without_target_creates_initial_version_and_active_pointer() -
 
     assert saved.version == "1.0.0"
     assert storage.read_active_version(TAG, saved.id) == "1.0.0"
-    assert storage.get(saved.ref(saved.id)).entity == draft
+    assert storage.get(NameModel, saved.id).entity == draft
 
 
-def test_azure_get_with_entity_version_bypasses_active_pointer() -> None:
+def test_azure_get_with_type_id_version_bypasses_active_pointer() -> None:
     storage = azure_storage_from_env()
     created = storage.set(NameModel(name="v1"))
     storage.set(NameModel(name="v2"), created.ref())
 
-    loaded = storage.get(NameModel(name="placeholder").ver(created.id, "1.0.0"))
+    loaded = storage.get(NameModel, created.id, "1.0.0")
 
     assert loaded.version == "1.0.0"
     assert loaded.entity == NameModel(name="v1")
@@ -210,21 +234,45 @@ def test_azure_set_with_entity_ref_creates_next_patch_and_updates_active() -> No
     assert storage.get(created.ref()).entity == NameModel(name="v2")
 
 
+def test_azure_set_with_id_creates_next_patch_and_updates_active() -> None:
+    storage = azure_storage_from_env()
+    created = storage.set(NameModel(name="v1"))
+
+    updated = storage.set(NameModel(name="v2"), created.id)
+
+    assert updated.id == created.id
+    assert updated.version == "1.0.1"
+    assert storage.read_active_version(TAG, created.id) == "1.0.1"
+    assert storage.get(NameModel, created.id).entity == NameModel(name="v2")
+
+
 def test_azure_set_with_entity_version_overwrites_specific_version_without_changing_active() -> None:
     storage = azure_storage_from_env()
     created = storage.set(NameModel(name="v1"))
     active = storage.set(NameModel(name="v2"), created.ref())
-    placeholder = NameModel(name="placeholder").ver(created.id, "1.0.0")
 
     overwritten = storage.set(
         NameModel(name="rewritten-v1"),
-        placeholder,
+        created,
     )
 
     assert overwritten.version == "1.0.0"
-    assert storage.get(placeholder).entity == NameModel(name="rewritten-v1")
+    assert storage.get(created).entity == NameModel(name="rewritten-v1")
     assert storage.get(created.ref()).version == active.version
     assert storage.get(created.ref()).entity == NameModel(name="v2")
+
+
+def test_azure_set_with_id_and_version_overwrites_specific_version_without_changing_active() -> None:
+    storage = azure_storage_from_env()
+    created = storage.set(NameModel(name="v1"))
+    active = storage.set(NameModel(name="v2"), created.id)
+
+    overwritten = storage.set(NameModel(name="rewritten-v1"), created.id, "1.0.0")
+
+    assert overwritten.version == "1.0.0"
+    assert storage.get(NameModel, created.id, "1.0.0").entity == NameModel(name="rewritten-v1")
+    assert storage.get(NameModel, created.id).version == active.version
+    assert storage.get(NameModel, created.id).entity == NameModel(name="v2")
 
 
 def test_azure_get_entity_ref_without_active_json_raises() -> None:

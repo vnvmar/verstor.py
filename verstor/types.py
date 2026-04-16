@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import ClassVar
+from typing import ClassVar, Never
 from uuid import uuid4
 
 from semver import Version
@@ -10,6 +10,17 @@ INITIAL_VERSION = Version.parse("1.0.0")
 
 class EntityBase(BaseModel):
     tag: ClassVar[str]
+
+    def patch[T: EntityBase](self: T, **changes: Never) -> T:
+        fields = type(self).model_fields
+        unknown = sorted(key for key in changes if key not in fields)
+        if unknown:
+            joined = ", ".join(repr(key) for key in unknown)
+            raise TypeError(f"Unknown patch field(s): {joined}")
+
+        data = self.model_dump()
+        data.update(changes)
+        return type(self).model_validate(data)
 
     def ref[T: EntityBase](self: T, id: str | None = None) -> EntityRef[T]:
         return EntityRef[T].of(type(self), id)
